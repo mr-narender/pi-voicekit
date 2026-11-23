@@ -144,6 +144,9 @@ const realTimerPort: TimerPort = {
 // (a single tap on the spacebar at the end of a word is ~80ms), too long
 // feels laggy. Users can dial higher via /voice-hold-delay or settings.json.
 const HOLD_THRESHOLD_DEFAULT_MS = 700;
+// The warmup countdown waits this long (or half the hold threshold, if shorter) so a plain tap
+// never flashes it, while a short configured threshold still shows it before recording starts.
+const WARMUP_SHOW_DELAY_MS = 250;
 const RELEASE_DETECT_MS = 500; // Gap in key-repeat that means "released" (non-Kitty)
 // macOS default InitialKeyRepeat is ~375ms, so 500ms
 // ensures the first repeat arrives before we decide "tap"
@@ -168,6 +171,31 @@ const CORRUPTION_GUARD_MS = 200; // Min gap between stop and restart
 // Debug logging — set PI_VOICE_DEBUG=1 to enable
 const VOICE_DEBUG = !!process.env.PI_VOICE_DEBUG;
 const VOICE_LOG_FILE = path.join(os.tmpdir(), "pi-voice-debug.log");
+
+// ─── Host capability probe ────────────────────────────────────────────
+// `peerDependencies` are `"*"` (Pi supplies the host packages), so the Pi running this code can
+// be older than the one it was verified against. Probing the surface we actually call is more
+// reliable than comparing version strings: an API's presence and its version number are not in
+// lockstep across Pi's 0.x line. Overlay-only verbs (`custom`, `select`, `confirm`) are not here —
+// they gate panels, not hold-to-talk, and a host without them still dictates.
+const REQUIRED_HOST_UI = [
+	"notify",
+	"setWidget",
+	"setStatus",
+	"getEditorText",
+	"setEditorText",
+	"pasteToEditor",
+	"onTerminalInput",
+] as const;
+
+function missingHostUi(ui: unknown): string[] {
+	if (!ui || typeof ui !== "object") return [...REQUIRED_HOST_UI];
+	const surface = ui as Record<string, unknown>;
+	return REQUIRED_HOST_UI.filter((name) => typeof surface[name] !== "function");
+}
+
+// Once per process: a reload fires session_start again and must not repeat the notice.
+let hostUiNoticeShown = false;
 
 // ─── Audio level tracking (module scope so streaming can access) ──────
 let audioLevel = 0;
@@ -381,6 +409,14 @@ function detectAudioCaptureTool(): AudioCaptureTool | null {
 export function resetCaptureToolProbeCache(): void {
 	_cmdExistsCache.clear();
 	_cachedAudioTool = undefined;
+}
+
+/**
+ * Test seam for the once-per-process host capability notice: every test file that loads this module
+ * shares one instance, so a case that runs against an incomplete UI would silence the next one.
+ */
+export function resetHostUiNotice(): void {
+	hostUiNoticeShown = false;
 }
 
 // ─── Abort helper — nuke everything synchronously ────────────────────────────
@@ -746,6 +782,7 @@ export default function (pi: ExtensionAPI) {
 	let kittyReleaseDetected = false;
 	let spaceDownTime: number | null = null;
 	let holdActivationTimer: ReturnType<typeof setTimeout> | null = null;
+	let warmupShowTimer: ReturnType<typeof setTimeout> | null = null; // delays the warmup widget past a plain tap
 	let spaceConsumed = false; // True once threshold passed and recording started
 	let releaseGapTimer: GapTimer | null = null; // gap-based release detection (see release-controller.ts)
 	let spacePressCount = 0; // Count of rapid space presses (for non-Kitty hold detection)
@@ -872,6 +909,10 @@ export default function (pi: ExtensionAPI) {
 		holdConfirmed = false;
 		clearHoldTimer();
 		clearReleaseTimer();
+		if (warmupShowTimer) {
+			clearTimeout(warmupShowTimer);
+			warmupShowTimer = null;
+		}
 		if (opts?.cooldown) errorCooldownUntil = Date.now() + opts.cooldown;
 	}
 
@@ -1432,7 +1473,7 @@ export default function (pi: ExtensionAPI) {
 						setVoiceState("idle");
 						if (holdDuration < 300) {
 							// Quick tap — just type a space
-							if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
+							if (ctx?.hasUI) ctx.ui.pasteToEditor(" "); // at the cursor; setEditorText would move it to the end and redraw
 						} else {
 							// Held long enough to see warmup but let go → show hint
 							ctx?.ui.notify("Hold SPACE longer to activate voice.", "info");
@@ -1444,7 +1485,7 @@ export default function (pi: ExtensionAPI) {
 					// Kitty path since we enter warmup on first press, but handle anyway)
 					if (spaceDownTime && !holdConfirmed && recordingController.state === "idle") {
 						resetHoldState();
-						if (ctx?.hasUI) ctx.ui.setEditorText((ctx.ui.getEditorText() || "") + " ");
+						if (ctx?.hasUI) ctx.ui.pasteToEditor(" "); // at the cursor; setEditorText would move it to the end and redraw
 						return { consume: true };
 					}
 
@@ -1622,7 +1663,14 @@ export default function (pi: ExtensionAPI) {
 						holdConfirmed = true; // Kitty: trust the press, release cancels
 
 						setVoiceState("warmup");
-						showWarmupWidget();
+						// Show the countdown only once the key is really held, so a plain tap never flashes it.
+						warmupShowTimer = setTimeout(
+							() => {
+								warmupShowTimer = null;
+								if (recordingController.state === "warmup") showWarmupWidget();
+							},
+							Math.min(WARMUP_SHOW_DELAY_MS, getHoldThresholdMs() / 2)
+						);
 
 						holdActivationTimer = setTimeout(() => {
 							holdActivationTimer = null;
@@ -1893,6 +1941,22 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx = startCtx;
+		// A Pi older than the verified baseline, or a host that dropped a verb we call. Say so once
+		// instead of letting hold-to-talk fail later with a bare TypeError inside a key handler.
+		if (startCtx.hasUI && !hostUiNoticeShown) {
+			const missing = missingHostUi(startCtx.ui);
+			if (missing.length > 0) {
+				hostUiNoticeShown = true;
+				const notice = [
+					`pi-voicekit needs a newer Pi: this one is missing ${missing.join(", ")}.`,
+					"",
+					"  Hold-to-talk and dictation may fail until Pi is updated.",
+					"  Run `pi update`, then restart.",
+				].join("\n");
+				if (missing.includes("notify")) voiceDebug("host UI capability gap", { missing });
+				else startCtx.ui.notify(notice, "warning");
+			}
+		}
 		currentCwd = startCtx.cwd;
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		if (config.localModel !== loaded.config.localModel || config.language !== loaded.config.language) {
